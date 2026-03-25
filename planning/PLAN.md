@@ -24,7 +24,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Watch prices stream** — prices flash green (uptick) or red (downtick) with subtle CSS animations that fade
 - **View sparkline mini-charts** — price action beside each ticker in the watchlist, accumulated on the frontend from the SSE stream since page load (sparklines fill in progressively)
 - **Click a ticker** to see a larger detailed chart in the main chart area
-- **Buy and sell shares** — market orders only, instant fill at current price, no fees, no confirmation dialog
+- **Buy and sell shares** — market orders only, whole shares only, instant fill at current price, no fees, no confirmation dialog
 - **Monitor their portfolio** — a heatmap (treemap) showing positions sized by weight and colored by P&L, plus a P&L chart tracking total portfolio value over time
 - **View a positions table** — ticker, quantity, average cost, current price, unrealized P&L, % change
 - **Chat with the AI assistant** — ask about their portfolio, get analysis, and have the AI execute trades and manage the watchlist through natural language
@@ -185,11 +185,12 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 ### SQLite with Lazy Initialization
 
-The backend checks for the SQLite database on startup (or first request). If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
+The backend initializes the SQLite database during FastAPI's lifespan startup event. If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
 
 - No separate migration step
 - No manual database setup
 - Fresh Docker volumes start with a clean, seeded database automatically
+- No first-request latency penalty — the app is ready to serve immediately
 
 ### Schema
 
@@ -211,7 +212,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
@@ -221,19 +222,26 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. Rows older than 24 hours are pruned periodically (see Snapshot Retention below).
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
 - `recorded_at` TEXT (ISO timestamp)
 
+### Snapshot Retention
+
+Portfolio snapshots are retained for 24 hours. The snapshot background task prunes rows older than 24 hours every 50 minutes (piggybacks on the existing 30-second recording task — prune once per ~100 writes). This bounds the table to ~2,880 rows per user regardless of container uptime.
+
+The `/api/portfolio/history` endpoint accepts an optional `?since=` ISO timestamp parameter. If omitted, it defaults to the last 4 hours. The frontend can adjust this window for zoom in/out within the 24-hour retention period.
+
 **chat_messages** — Conversation history with LLM
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
+- `session_id` TEXT (UUID — groups messages into conversations)
 - `role` TEXT (`"user"` or `"assistant"`)
 - `content` TEXT
 - `actions` TEXT (JSON — trades executed, watchlist changes made; null for user messages)
@@ -258,7 +266,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 |--------|------|-------------|
 | GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
 | POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
-| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| GET | `/api/portfolio/history` | Portfolio value snapshots (optional `?since=` ISO timestamp, default last 4 hours) |
 
 ### Watchlist
 | Method | Path | Description |
@@ -290,13 +298,22 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the current conversation's history from the `chat_messages` table (messages belonging to the active session only — see Chat Sessions below)
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
 8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+
+### Chat Sessions
+
+Chat history is organized into sessions. Only the current session's messages are loaded into LLM context. Previous sessions are persisted in the database and can be loaded on demand by the user via the chat UI. This keeps LLM context bounded while preserving history across container restarts.
+
+- A new session starts when the user clicks "New Chat" (or on first launch if no sessions exist)
+- The `chat_messages` table includes a `session_id` column to group messages
+- The frontend provides a way to list and switch between previous sessions
+- Only the active session's messages are sent to the LLM
 
 ### Structured Output Schema
 
@@ -334,8 +351,11 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 - Suggest trades with reasoning
 - Execute trades when the user asks or agrees
 - Manage the watchlist proactively
+- **Always reference the current watchlist and positions provided in context before proposing additions/removals** — avoid adding tickers already on the watchlist or removing ones that aren't
 - Be concise and data-driven in responses
 - Always respond with valid structured JSON
+
+The backend silently ignores duplicate watchlist adds or removes of non-existent tickers — these are not surfaced to the user.
 
 ### LLM Mock Mode
 
@@ -454,3 +474,15 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Open Questions
+
+*Items to resolve as development progresses.*
+
+1. **`backend/db/` vs `db/` ambiguity** — Section 4 lists `backend/db/` for schema/seed SQL, but the codebase uses in-code initialization under `backend/app/`. Decide whether to formalize a `backend/db/` directory or remove it from the directory tree spec.
+
+2. **Database path resolution** — Should the SQLite path be configurable via env var (e.g., `DATABASE_PATH=db/finally.db`) or hardcoded? An env var with a sensible default keeps local dev and Docker flexible.
+
+3. **LLM model fallback** — No fallback defined yet if `openrouter/openai/gpt-oss-120b` is unavailable. To be revisited.
